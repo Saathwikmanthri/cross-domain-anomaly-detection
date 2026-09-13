@@ -1,1 +1,1 @@
-Expenditure on Completed and On-going Works as on Date,Works Completed,Allocated Limit for Honble MPs this 3 files are the testing data while the other 2 are the training data sets.
+The model was trained and evaluated using the complete Kaggle dataset. Representative samples are included in this repository for reproducibility and demonstration.
