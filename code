@@ -1,0 +1,2689 @@
+# ============================================================
+# CROSS-DOMAIN BEHAVIORAL ANOMALY DETECTION
+# ============================================================
+#
+# Project:
+# Detecting Fraud When Normal Behaviour Varies Across Customers
+#
+# Approach:
+# 1. Train an Isolation Forest using normal Kaggle transactions
+# 2. Evaluate on Kaggle fraud test data
+# 3. Transfer the behavioral anomaly model to SIH/MPLADS data
+# 4. Add SIH-specific contextual signals
+# 5. Generate investigation-priority scores
+# 6. Export results and visualizations
+#
+# IMPORTANT:
+# SIH records are NOT labeled as confirmed fraud.
+# They are reported as behavioral anomalies / investigation priorities.
+# ============================================================
+
+
+# ============================================================
+# STEP 1 — IMPORT LIBRARIES
+# ============================================================
+
+import os
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    roc_auc_score,
+    average_precision_score,
+    roc_curve,
+    precision_recall_curve
+)
+
+warnings.filterwarnings("ignore")
+
+print("=" * 70)
+print("CROSS-DOMAIN BEHAVIORAL ANOMALY DETECTION")
+print("=" * 70)
+print("Libraries loaded successfully.")
+
+
+# ============================================================
+# STEP 2 — FILE PATHS
+# ============================================================
+
+fraud_train_path = "/content/fraudTrain.csv"
+fraud_test_path = "/content/fraudTest.csv"
+
+sih_exp_path = (
+    "/content/Expenditure on Completed and On-going Works as on Date.csv"
+)
+
+sih_completed_path = "/content/Works Completed.csv"
+
+sih_allocation_path = (
+    "/content/Allocated Limit for Honble MPs.csv"
+)
+
+
+# ============================================================
+# STEP 3 — CHECK REQUIRED FILES
+# ============================================================
+
+required_files = {
+    "Kaggle training data": fraud_train_path,
+    "Kaggle test data": fraud_test_path,
+    "SIH expenditure data": sih_exp_path,
+    "SIH completed works": sih_completed_path,
+    "SIH allocation data": sih_allocation_path
+}
+
+print("\nChecking required files...\n")
+
+missing_files = []
+
+for name, path in required_files.items():
+
+    if os.path.exists(path):
+        size_mb = os.path.getsize(path) / (1024 ** 2)
+
+        print(
+            f"FOUND  | {name:<28} | "
+            f"{size_mb:.2f} MB"
+        )
+
+    else:
+        print(
+            f"MISSING | {name:<28} | {path}"
+        )
+
+        missing_files.append(
+            (name, path)
+        )
+
+
+if missing_files:
+
+    print("\n" + "=" * 70)
+    print("MISSING FILES")
+    print("=" * 70)
+
+    for name, path in missing_files:
+        print(f"- {name}: {path}")
+
+    raise FileNotFoundError(
+        "Required dataset files are missing. "
+        "Upload them to /content and run this cell again."
+    )
+
+print("\nAll required files are available.")
+
+
+# ============================================================
+# STEP 4 — LOAD DATASETS
+# ============================================================
+
+print("\n" + "=" * 70)
+print("LOADING DATASETS")
+print("=" * 70)
+
+
+# Kaggle train
+fraud_train = pd.read_csv(
+    fraud_train_path,
+    low_memory=False
+)
+
+
+# Kaggle test
+# Python engine + skip malformed rows because the supplied
+# reduced CSV contains malformed records.
+fraud_test = pd.read_csv(
+    fraud_test_path,
+    engine="python",
+    on_bad_lines="skip"
+)
+
+
+# SIH datasets
+sih_exp = pd.read_csv(
+    sih_exp_path,
+    low_memory=False
+)
+
+sih_completed = pd.read_csv(
+    sih_completed_path,
+    low_memory=False
+)
+
+sih_allocation = pd.read_csv(
+    sih_allocation_path,
+    low_memory=False
+)
+
+
+# Strip whitespace from column names
+for df in [
+    fraud_train,
+    fraud_test,
+    sih_exp,
+    sih_completed,
+    sih_allocation
+]:
+
+    df.columns = df.columns.str.strip()
+
+
+print("\nDataset shapes:")
+
+print("Kaggle train      :", fraud_train.shape)
+print("Kaggle test       :", fraud_test.shape)
+print("SIH expenditure   :", sih_exp.shape)
+print("SIH completed     :", sih_completed.shape)
+print("SIH allocation    :", sih_allocation.shape)
+
+
+# ============================================================
+# STEP 5 — VERIFY SIH DATA STRUCTURE
+# ============================================================
+
+print("\n" + "=" * 70)
+print("VERIFYING SIH DATA")
+print("=" * 70)
+
+
+required_sih_exp_columns = [
+    "State",
+    "Work",
+    "Work ID",
+    "Hon'ble Members of Parliament",
+    "Constituency",
+    "Expenditure Date",
+    "Vendor Name",
+    "Payment Status",
+    "Fund Disbursed Amount ( ₹ )"
+]
+
+required_sih_completed_columns = [
+    "Work",
+    "State",
+    "Hon'ble Members of Parliament",
+    "Constituency",
+    "Completion Date",
+    "Amount Disbursed ( ₹ )"
+]
+
+required_sih_allocation_columns = [
+    "Hon'ble Members of Parliaments",
+    "Constituency",
+    "Allocated AMOUNT ( ₹ )"
+]
+
+
+for column in required_sih_exp_columns:
+
+    if column not in sih_exp.columns:
+        raise ValueError(
+            f"Missing SIH expenditure column: {column}"
+        )
+
+
+for column in required_sih_completed_columns:
+
+    if column not in sih_completed.columns:
+        raise ValueError(
+            f"Missing SIH completed-work column: {column}"
+        )
+
+
+for column in required_sih_allocation_columns:
+
+    if column not in sih_allocation.columns:
+        raise ValueError(
+            f"Missing SIH allocation column: {column}"
+        )
+
+
+print("SIH structure verified successfully.")
+
+
+# ============================================================
+# STEP 6 — CLEAN KAGGLE DATA
+# ============================================================
+
+print("\n" + "=" * 70)
+print("CLEANING KAGGLE DATA")
+print("=" * 70)
+
+
+# Remove rows without target
+fraud_train = fraud_train.dropna(
+    subset=["is_fraud"]
+).copy()
+
+fraud_test = fraud_test.dropna(
+    subset=["is_fraud"]
+).copy()
+
+
+# Target conversion
+fraud_train["is_fraud"] = (
+    fraud_train["is_fraud"]
+    .astype(int)
+)
+
+fraud_test["is_fraud"] = (
+    fraud_test["is_fraud"]
+    .astype(int)
+)
+
+
+# Date conversion
+fraud_train["trans_date_trans_time"] = (
+    pd.to_datetime(
+        fraud_train["trans_date_trans_time"],
+        errors="coerce"
+    )
+)
+
+fraud_test["trans_date_trans_time"] = (
+    pd.to_datetime(
+        fraud_test["trans_date_trans_time"],
+        errors="coerce"
+    )
+)
+
+
+# Amount conversion
+fraud_train["amt"] = pd.to_numeric(
+    fraud_train["amt"],
+    errors="coerce"
+)
+
+fraud_test["amt"] = pd.to_numeric(
+    fraud_test["amt"],
+    errors="coerce"
+)
+
+
+# Entity
+fraud_train["cc_num"] = (
+    fraud_train["cc_num"]
+    .fillna("UNKNOWN")
+    .astype(str)
+)
+
+fraud_test["cc_num"] = (
+    fraud_test["cc_num"]
+    .fillna("UNKNOWN")
+    .astype(str)
+)
+
+
+# Category
+for df in [fraud_train, fraud_test]:
+
+    df["category"] = (
+        df["category"]
+        .fillna("UNKNOWN")
+        .astype(str)
+    )
+
+    df["merchant"] = (
+        df["merchant"]
+        .fillna("UNKNOWN")
+        .astype(str)
+    )
+
+
+# Remove invalid essential records
+fraud_train = fraud_train.dropna(
+    subset=[
+        "trans_date_trans_time",
+        "amt"
+    ]
+).copy()
+
+fraud_test = fraud_test.dropna(
+    subset=[
+        "trans_date_trans_time",
+        "amt"
+    ]
+).copy()
+
+
+# Keep non-negative transaction amounts
+fraud_train = fraud_train[
+    fraud_train["amt"] >= 0
+].reset_index(drop=True)
+
+fraud_test = fraud_test[
+    fraud_test["amt"] >= 0
+].reset_index(drop=True)
+
+
+print("\nClean Kaggle shapes:")
+print("Train:", fraud_train.shape)
+print("Test :", fraud_test.shape)
+
+print("\nTraining target distribution:")
+print(
+    fraud_train["is_fraud"]
+    .value_counts()
+)
+
+print("\nTest target distribution:")
+print(
+    fraud_test["is_fraud"]
+    .value_counts()
+)
+
+
+# ============================================================
+# STEP 7 — CLEAN SIH DATA
+# ============================================================
+
+print("\n" + "=" * 70)
+print("CLEANING SIH DATA")
+print("=" * 70)
+
+
+# Date
+sih_exp["Expenditure Date"] = (
+    pd.to_datetime(
+        sih_exp["Expenditure Date"],
+        errors="coerce"
+    )
+)
+
+
+# Amount
+sih_exp["Fund Disbursed Amount ( ₹ )"] = (
+    pd.to_numeric(
+        sih_exp["Fund Disbursed Amount ( ₹ )"],
+        errors="coerce"
+    )
+)
+
+
+# Text columns
+for column in [
+    "Hon'ble Members of Parliament",
+    "Work",
+    "Vendor Name",
+    "State",
+    "Constituency"
+]:
+
+    sih_exp[column] = (
+        sih_exp[column]
+        .fillna("UNKNOWN")
+        .astype(str)
+    )
+
+
+# Remove invalid expenditure records
+sih_exp = sih_exp.dropna(
+    subset=[
+        "Expenditure Date",
+        "Fund Disbursed Amount ( ₹ )"
+    ]
+).copy()
+
+
+# Non-negative expenditure
+sih_exp = sih_exp[
+    sih_exp["Fund Disbursed Amount ( ₹ )"] >= 0
+].reset_index(drop=True)
+
+
+print(
+    "Clean SIH expenditure shape:",
+    sih_exp.shape
+)
+
+
+# ============================================================
+# STEP 8 — ROBUST BEHAVIORAL FEATURE ENGINEERING
+# ============================================================
+#
+# IMPORTANT:
+# Training baselines are learned from the training data.
+# Test/SIH records are transformed using the appropriate
+# reference baselines rather than calculating a new model.
+# ============================================================
+
+
+BASE_FEATURES = [
+    "amount_ratio_to_entity_mean",
+    "entity_z_amount",
+    "median_difference_ratio",
+    "entity_frequency",
+    "category_frequency",
+    "category_amount_ratio",
+    "vendor_frequency",
+    "vendor_amount_ratio",
+    "entity_vendor_frequency",
+    "days_since_previous",
+    "daily_entity_count"
+]
+
+
+def fit_behavior_baseline(
+    df,
+    entity_col,
+    amount_col,
+    category_col,
+    vendor_col,
+    date_col
+):
+
+    data = df.copy()
+
+    data[amount_col] = pd.to_numeric(
+        data[amount_col],
+        errors="coerce"
+    ).fillna(0)
+
+    data[date_col] = pd.to_datetime(
+        data[date_col],
+        errors="coerce"
+    )
+
+    data[entity_col] = (
+        data[entity_col]
+        .fillna("UNKNOWN")
+        .astype(str)
+    )
+
+    data[category_col] = (
+        data[category_col]
+        .fillna("UNKNOWN")
+        .astype(str)
+    )
+
+    data[vendor_col] = (
+        data[vendor_col]
+        .fillna("UNKNOWN")
+        .astype(str)
+    )
+
+
+    # Entity statistics
+    entity_stats = (
+        data
+        .groupby(entity_col)[amount_col]
+        .agg(
+            entity_mean="mean",
+            entity_std="std",
+            entity_median="median",
+            entity_frequency="count"
+        )
+        .reset_index()
+    )
+
+    entity_stats["entity_std"] = (
+        entity_stats["entity_std"]
+        .fillna(0)
+    )
+
+
+    # Category statistics
+    category_stats = (
+        data
+        .groupby(category_col)[amount_col]
+        .agg(
+            category_mean="mean",
+            category_frequency="count"
+        )
+        .reset_index()
+    )
+
+
+    # Vendor statistics
+    vendor_stats = (
+        data
+        .groupby(vendor_col)[amount_col]
+        .agg(
+            vendor_mean="mean",
+            vendor_frequency="count"
+        )
+        .reset_index()
+    )
+
+
+    # Entity-vendor frequency
+    entity_vendor_stats = (
+        data
+        .groupby(
+            [entity_col, vendor_col]
+        )[amount_col]
+        .count()
+        .reset_index(
+            name="entity_vendor_frequency"
+        )
+    )
+
+
+    # Global fallbacks
+    global_stats = {
+        "amount_mean": data[amount_col].mean(),
+        "amount_std": data[amount_col].std(),
+        "amount_median": data[amount_col].median(),
+        "category_mean": data[amount_col].mean(),
+        "vendor_mean": data[amount_col].mean(),
+        "category_frequency": 1,
+        "vendor_frequency": 1,
+        "entity_frequency": 1
+    }
+
+
+    return {
+        "entity_stats": entity_stats,
+        "category_stats": category_stats,
+        "vendor_stats": vendor_stats,
+        "entity_vendor_stats": entity_vendor_stats,
+        "global_stats": global_stats
+    }
+
+
+def create_behavior_features(
+    df,
+    baseline,
+    entity_col,
+    amount_col,
+    category_col,
+    vendor_col,
+    date_col
+):
+
+    data = df.copy()
+
+    data[amount_col] = pd.to_numeric(
+        data[amount_col],
+        errors="coerce"
+    ).fillna(0)
+
+    data[date_col] = pd.to_datetime(
+        data[date_col],
+        errors="coerce"
+    )
+
+    data[entity_col] = (
+        data[entity_col]
+        .fillna("UNKNOWN")
+        .astype(str)
+    )
+
+    data[category_col] = (
+        data[category_col]
+        .fillna("UNKNOWN")
+        .astype(str)
+    )
+
+    data[vendor_col] = (
+        data[vendor_col]
+        .fillna("UNKNOWN")
+        .astype(str)
+    )
+
+
+    # --------------------------------------------------------
+    # Preserve original ordering for output
+    # --------------------------------------------------------
+
+    data["_original_order"] = np.arange(
+        len(data)
+    )
+
+
+    # --------------------------------------------------------
+    # Sort for time-based calculations
+    # --------------------------------------------------------
+
+    data = data.sort_values(
+        [entity_col, date_col]
+    ).reset_index(drop=True)
+
+
+    data["amount"] = data[amount_col]
+
+
+    # --------------------------------------------------------
+    # Entity statistics
+    # --------------------------------------------------------
+
+    data = data.merge(
+        baseline["entity_stats"],
+        on=entity_col,
+        how="left"
+    )
+
+
+    # Global fallback
+    global_stats = baseline["global_stats"]
+
+    data["entity_mean"] = (
+        data["entity_mean"]
+        .fillna(global_stats["amount_mean"])
+    )
+
+    data["entity_std"] = (
+        data["entity_std"]
+        .fillna(global_stats["amount_std"])
+    )
+
+    data["entity_median"] = (
+        data["entity_median"]
+        .fillna(global_stats["amount_median"])
+    )
+
+    data["entity_frequency"] = (
+        data["entity_frequency"]
+        .fillna(global_stats["entity_frequency"])
+    )
+
+
+    # --------------------------------------------------------
+    # Entity behavioral features
+    # --------------------------------------------------------
+
+    data["amount_ratio_to_entity_mean"] = (
+        data["amount"] /
+        (data["entity_mean"] + 1e-6)
+    )
+
+    data["entity_z_amount"] = (
+        (data["amount"] - data["entity_mean"])
+        /
+        (data["entity_std"] + 1e-6)
+    )
+
+    data["median_difference_ratio"] = (
+        abs(
+            data["amount"]
+            - data["entity_median"]
+        )
+        /
+        (data["entity_median"] + 1e-6)
+    )
+
+
+    # --------------------------------------------------------
+    # Category behavior
+    # --------------------------------------------------------
+
+    data = data.merge(
+        baseline["category_stats"],
+        on=category_col,
+        how="left"
+    )
+
+    data["category_mean"] = (
+        data["category_mean"]
+        .fillna(global_stats["category_mean"])
+    )
+
+    data["category_frequency"] = (
+        data["category_frequency"]
+        .fillna(0)
+    )
+
+    data["category_amount_ratio"] = (
+        data["amount"] /
+        (data["category_mean"] + 1e-6)
+    )
+
+
+    # --------------------------------------------------------
+    # Vendor behavior
+    # --------------------------------------------------------
+
+    data = data.merge(
+        baseline["vendor_stats"],
+        on=vendor_col,
+        how="left"
+    )
+
+    data["vendor_mean"] = (
+        data["vendor_mean"]
+        .fillna(global_stats["vendor_mean"])
+    )
+
+    data["vendor_frequency"] = (
+        data["vendor_frequency"]
+        .fillna(0)
+    )
+
+    data["vendor_amount_ratio"] = (
+        data["amount"] /
+        (data["vendor_mean"] + 1e-6)
+    )
+
+
+    # --------------------------------------------------------
+    # Entity-vendor relationship
+    # --------------------------------------------------------
+
+    data = data.merge(
+        baseline["entity_vendor_stats"],
+        on=[
+            entity_col,
+            vendor_col
+        ],
+        how="left"
+    )
+
+    data["entity_vendor_frequency"] = (
+        data["entity_vendor_frequency"]
+        .fillna(0)
+    )
+
+
+    # --------------------------------------------------------
+    # Time behavior
+    #
+    # For each dataset, calculate elapsed time within entity.
+    # This does not use the target label.
+    # --------------------------------------------------------
+
+    data["days_since_previous"] = (
+        data
+        .groupby(entity_col)[date_col]
+        .diff()
+        .dt.total_seconds()
+        .div(86400)
+    )
+
+    data["days_since_previous"] = (
+        data["days_since_previous"]
+        .fillna(999)
+        .clip(lower=0)
+    )
+
+
+    # --------------------------------------------------------
+    # Daily transaction count
+    # --------------------------------------------------------
+
+    data["date_only"] = (
+        data[date_col].dt.date
+    )
+
+    data["daily_entity_count"] = (
+        data
+        .groupby(
+            [
+                entity_col,
+                "date_only"
+            ]
+        )[amount_col]
+        .transform("count")
+    )
+
+
+    # --------------------------------------------------------
+    # Final cleanup
+    # --------------------------------------------------------
+
+    data = data.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    data[BASE_FEATURES] = (
+        data[BASE_FEATURES]
+        .fillna(0)
+    )
+
+
+    # Restore original ordering
+    data = data.sort_values(
+        "_original_order"
+    ).reset_index(drop=True)
+
+    data = data.drop(
+        columns=["_original_order"]
+    )
+
+    return data
+
+
+# ============================================================
+# STEP 9 — BUILD KAGGLE TRAINING BASELINE
+# ============================================================
+
+print("\n" + "=" * 70)
+print("BUILDING KAGGLE NORMAL-BEHAVIOR BASELINE")
+print("=" * 70)
+
+
+normal_train = fraud_train[
+    fraud_train["is_fraud"] == 0
+].copy()
+
+
+fraud_train_count = int(
+    (
+        fraud_train["is_fraud"] == 1
+    ).sum()
+)
+
+
+print(
+    "Total training records :",
+    len(fraud_train)
+)
+
+print(
+    "Normal training records:",
+    len(normal_train)
+)
+
+print(
+    "Fraud records excluded :",
+    fraud_train_count
+)
+
+
+# Learn behavioral baseline ONLY from normal training data
+kaggle_baseline = fit_behavior_baseline(
+    normal_train,
+    entity_col="cc_num",
+    amount_col="amt",
+    category_col="category",
+    vendor_col="merchant",
+    date_col="trans_date_trans_time"
+)
+
+
+# ============================================================
+# STEP 10 — CREATE KAGGLE TRAIN FEATURES
+# ============================================================
+
+print("\n" + "=" * 70)
+print("KAGGLE TRAIN FEATURE ENGINEERING")
+print("=" * 70)
+
+
+kaggle_train_features = create_behavior_features(
+    fraud_train,
+    kaggle_baseline,
+    entity_col="cc_num",
+    amount_col="amt",
+    category_col="category",
+    vendor_col="merchant",
+    date_col="trans_date_trans_time"
+)
+
+
+X_train = (
+    kaggle_train_features[
+        BASE_FEATURES
+    ]
+    .replace([np.inf, -np.inf], np.nan)
+    .fillna(0)
+)
+
+
+X_normal = X_train.loc[
+    fraud_train["is_fraud"] == 0
+].copy()
+
+
+print(
+    "Training feature matrix:",
+    X_train.shape
+)
+
+print(
+    "Normal training matrix:",
+    X_normal.shape
+)
+
+print(
+    "Missing values:",
+    X_train.isna().sum().sum()
+)
+
+print(
+    "Infinite values:",
+    np.isinf(
+        X_train.to_numpy()
+    ).sum()
+)
+
+
+# ============================================================
+# STEP 11 — SCALE + TRAIN ISOLATION FOREST
+# ============================================================
+
+print("\n" + "=" * 70)
+print("TRAINING ISOLATION FOREST")
+print("=" * 70)
+
+
+scaler = StandardScaler()
+
+X_normal_scaled = scaler.fit_transform(
+    X_normal
+)
+
+
+isolation_forest = IsolationForest(
+    n_estimators=300,
+    max_samples=min(
+        100000,
+        len(X_normal_scaled)
+    ),
+    contamination=0.01,
+    random_state=42,
+    n_jobs=-1
+)
+
+
+isolation_forest.fit(
+    X_normal_scaled
+)
+
+
+print(
+    "Isolation Forest training completed."
+)
+
+print(
+    "Number of trees:",
+    isolation_forest.n_estimators
+)
+
+print(
+    "Training matrix:",
+    X_normal_scaled.shape
+)
+
+
+# ============================================================
+# STEP 12 — KAGGLE TEST FEATURE ENGINEERING
+# ============================================================
+
+print("\n" + "=" * 70)
+print("KAGGLE TEST FEATURE ENGINEERING")
+print("=" * 70)
+
+
+kaggle_test_features = create_behavior_features(
+    fraud_test,
+    kaggle_baseline,
+    entity_col="cc_num",
+    amount_col="amt",
+    category_col="category",
+    vendor_col="merchant",
+    date_col="trans_date_trans_time"
+)
+
+
+X_test = (
+    kaggle_test_features[
+        BASE_FEATURES
+    ]
+    .replace([np.inf, -np.inf], np.nan)
+    .fillna(0)
+)
+
+
+X_test_scaled = scaler.transform(
+    X_test
+)
+
+
+print(
+    "Test feature matrix:",
+    X_test.shape
+)
+
+print(
+    "Scaled test matrix:",
+    X_test_scaled.shape
+)
+
+
+# ============================================================
+# STEP 13 — KAGGLE EVALUATION
+# ============================================================
+
+print("\n" + "=" * 70)
+print("KAGGLE MODEL EVALUATION")
+print("=" * 70)
+
+
+test_prediction = (
+    isolation_forest
+    .predict(X_test_scaled)
+)
+
+
+test_score = (
+    -isolation_forest
+    .score_samples(X_test_scaled)
+)
+
+
+y_true = fraud_test[
+    "is_fraud"
+].astype(int)
+
+
+y_pred = (
+    test_prediction == -1
+).astype(int)
+
+
+kaggle_test_features[
+    "anomaly_score"
+] = test_score
+
+kaggle_test_features[
+    "predicted_anomaly"
+] = y_pred
+
+
+# Confusion matrix
+cm = confusion_matrix(
+    y_true,
+    y_pred
+)
+
+
+# Classification report
+report = classification_report(
+    y_true,
+    y_pred,
+    digits=4
+)
+
+
+roc_auc = roc_auc_score(
+    y_true,
+    test_score
+)
+
+
+pr_auc = average_precision_score(
+    y_true,
+    test_score
+)
+
+
+accuracy = (
+    y_pred == y_true
+).mean()
+
+
+print("\nPrediction distribution:")
+print(
+    pd.Series(y_pred)
+    .value_counts()
+    .rename(
+        index={
+            0: "Normal",
+            1: "Anomaly"
+        }
+    )
+)
+
+
+print("\nConfusion Matrix:")
+print(cm)
+
+
+print("\nClassification Report:")
+print(report)
+
+
+print(
+    "ROC-AUC:",
+    round(roc_auc, 4)
+)
+
+print(
+    "PR-AUC :",
+    round(pr_auc, 4)
+)
+
+
+# ============================================================
+# STEP 14 — KAGGLE ROC + PRECISION-RECALL CURVES
+# ============================================================
+
+print("\n" + "=" * 70)
+print("GENERATING KAGGLE EVALUATION PLOTS")
+print("=" * 70)
+
+
+fpr, tpr, _ = roc_curve(
+    y_true,
+    test_score
+)
+
+
+precision, recall, _ = (
+    precision_recall_curve(
+        y_true,
+        test_score
+    )
+)
+
+
+plt.figure(figsize=(8, 6))
+
+plt.plot(
+    fpr,
+    tpr,
+    label=f"Isolation Forest (AUC = {roc_auc:.4f})"
+)
+
+plt.plot(
+    [0, 1],
+    [0, 1],
+    linestyle="--"
+)
+
+plt.xlabel(
+    "False Positive Rate"
+)
+
+plt.ylabel(
+    "True Positive Rate"
+)
+
+plt.title(
+    "ROC Curve — Kaggle Evaluation"
+)
+
+plt.legend()
+
+plt.tight_layout()
+
+plt.savefig(
+    "/content/kaggle_roc_curve.png",
+    dpi=300
+)
+
+plt.show()
+
+
+plt.figure(figsize=(8, 6))
+
+plt.plot(
+    recall,
+    precision,
+    label=f"PR-AUC = {pr_auc:.4f}"
+)
+
+plt.xlabel(
+    "Recall"
+)
+
+plt.ylabel(
+    "Precision"
+)
+
+plt.title(
+    "Precision-Recall Curve — Kaggle Evaluation"
+)
+
+plt.legend()
+
+plt.tight_layout()
+
+plt.savefig(
+    "/content/kaggle_precision_recall_curve.png",
+    dpi=300
+)
+
+plt.show()
+
+
+# ============================================================
+# STEP 15 — SIH BEHAVIORAL FEATURE ENGINEERING
+# ============================================================
+
+print("\n" + "=" * 70)
+print("SIH BEHAVIORAL FEATURE ENGINEERING")
+print("=" * 70)
+
+
+# IMPORTANT:
+# SIH is a different domain.
+# We calculate its own behavioral statistics for contextual
+# representation, while the anomaly model itself remains
+# trained on Kaggle normal behavior.
+
+sih_baseline = fit_behavior_baseline(
+    sih_exp,
+    entity_col="Hon'ble Members of Parliament",
+    amount_col="Fund Disbursed Amount ( ₹ )",
+    category_col="Work",
+    vendor_col="Vendor Name",
+    date_col="Expenditure Date"
+)
+
+
+sih_features = create_behavior_features(
+    sih_exp,
+    sih_baseline,
+    entity_col="Hon'ble Members of Parliament",
+    amount_col="Fund Disbursed Amount ( ₹ )",
+    category_col="Work",
+    vendor_col="Vendor Name",
+    date_col="Expenditure Date"
+)
+
+
+X_sih = (
+    sih_features[
+        BASE_FEATURES
+    ]
+    .replace([np.inf, -np.inf], np.nan)
+    .fillna(0)
+)
+
+
+print(
+    "SIH original shape:",
+    sih_exp.shape
+)
+
+print(
+    "SIH feature shape:",
+    sih_features.shape
+)
+
+print(
+    "SIH model matrix:",
+    X_sih.shape
+)
+
+print(
+    "Missing values:",
+    X_sih.isna().sum().sum()
+)
+
+print(
+    "Infinite values:",
+    np.isinf(
+        X_sih.to_numpy()
+    ).sum()
+)
+
+
+# ============================================================
+# STEP 16 — CROSS-DOMAIN SIH ANOMALY DETECTION
+# ============================================================
+
+print("\n" + "=" * 70)
+print("CROSS-DOMAIN SIH ANOMALY DETECTION")
+print("=" * 70)
+
+
+# Use the Kaggle-fitted scaler
+X_sih_scaled = scaler.transform(
+    X_sih
+)
+
+
+# Use the Kaggle-trained Isolation Forest
+sih_prediction = (
+    isolation_forest
+    .predict(X_sih_scaled)
+)
+
+
+sih_anomaly_score = (
+    -isolation_forest
+    .score_samples(X_sih_scaled)
+)
+
+
+sih_features[
+    "anomaly_score"
+] = sih_anomaly_score
+
+
+sih_features[
+    "predicted_anomaly"
+] = (
+    sih_prediction == -1
+)
+
+
+sih_anomaly_count = int(
+    sih_features[
+        "predicted_anomaly"
+    ].sum()
+)
+
+
+sih_total = len(
+    sih_features
+)
+
+
+sih_anomaly_percentage = (
+    sih_anomaly_count /
+    sih_total
+) * 100
+
+
+print(
+    "SIH scaled matrix:",
+    X_sih_scaled.shape
+)
+
+print(
+    "\nTotal SIH records:",
+    sih_total
+)
+
+print(
+    "Behavioral anomalies:",
+    sih_anomaly_count
+)
+
+print(
+    "Anomaly percentage:",
+    round(
+        sih_anomaly_percentage,
+        2
+    ),
+    "%"
+)
+
+
+# ============================================================
+# STEP 17 — MP CONTEXT
+# ============================================================
+
+print("\n" + "=" * 70)
+print("MP-LEVEL EXPENDITURE ANALYSIS")
+print("=" * 70)
+
+
+mp_stats = (
+    sih_exp
+    .groupby(
+        "Hon'ble Members of Parliament"
+    )[
+        "Fund Disbursed Amount ( ₹ )"
+    ]
+    .agg(
+        mp_mean_amount="mean",
+        mp_std_amount="std",
+        mp_median_amount="median",
+        mp_transaction_count="count",
+        mp_total_expenditure="sum"
+    )
+    .reset_index()
+)
+
+
+mp_stats["mp_std_amount"] = (
+    mp_stats["mp_std_amount"]
+    .fillna(0)
+)
+
+
+final_sih = sih_features.merge(
+    mp_stats,
+    on="Hon'ble Members of Parliament",
+    how="left"
+)
+
+
+final_sih["mp_expenditure_z"] = (
+    (
+        final_sih[
+            "Fund Disbursed Amount ( ₹ )"
+        ]
+        -
+        final_sih[
+            "mp_mean_amount"
+        ]
+    )
+    /
+    (
+        final_sih[
+            "mp_std_amount"
+        ]
+        + 1e-6
+    )
+)
+
+
+final_sih[
+    "mp_expenditure_flag"
+] = (
+    final_sih[
+        "mp_expenditure_z"
+    ] >= 3
+).astype(int)
+
+
+print(
+    "Unusually high MP expenditure records:",
+    int(
+        final_sih[
+            "mp_expenditure_flag"
+        ].sum()
+    )
+)
+
+
+# ============================================================
+# STEP 18 — VENDOR CONTEXT
+# ============================================================
+
+print("\n" + "=" * 70)
+print("VENDOR ACTIVITY ANALYSIS")
+print("=" * 70)
+
+
+vendor_stats = (
+    sih_exp
+    .groupby("Vendor Name")[
+        "Fund Disbursed Amount ( ₹ )"
+    ]
+    .agg(
+        vendor_transaction_count="count",
+        vendor_total_amount="sum",
+        vendor_mean_amount="mean"
+    )
+    .reset_index()
+)
+
+
+final_sih = final_sih.merge(
+    vendor_stats,
+    on="Vendor Name",
+    how="left"
+)
+
+
+vendor_count_mean = (
+    vendor_stats[
+        "vendor_transaction_count"
+    ].mean()
+)
+
+vendor_count_std = (
+    vendor_stats[
+        "vendor_transaction_count"
+    ].std()
+)
+
+
+final_sih[
+    "vendor_activity_z"
+] = (
+    (
+        final_sih[
+            "vendor_transaction_count"
+        ]
+        -
+        vendor_count_mean
+    )
+    /
+    (
+        vendor_count_std
+        + 1e-6
+    )
+)
+
+
+final_sih[
+    "vendor_activity_flag"
+] = (
+    final_sih[
+        "vendor_activity_z"
+    ] >= 3
+).astype(int)
+
+
+print(
+    "Unusually high vendor activity records:",
+    int(
+        final_sih[
+            "vendor_activity_flag"
+        ].sum()
+    )
+)
+
+
+# ============================================================
+# STEP 19 — REPEATED TRANSACTION PATTERNS
+# ============================================================
+
+print("\n" + "=" * 70)
+print("REPEATED TRANSACTION PATTERN ANALYSIS")
+print("=" * 70)
+
+
+duplicate_columns = [
+    "Hon'ble Members of Parliament",
+    "Work",
+    "Vendor Name",
+    "Fund Disbursed Amount ( ₹ )"
+]
+
+
+repeated_counts = (
+    sih_exp
+    .groupby(
+        duplicate_columns
+    )
+    .size()
+    .reset_index(
+        name="repeated_pattern_count"
+    )
+)
+
+
+final_sih = final_sih.merge(
+    repeated_counts,
+    on=duplicate_columns,
+    how="left"
+)
+
+
+final_sih[
+    "repeated_pattern_count"
+] = (
+    final_sih[
+        "repeated_pattern_count"
+    ]
+    .fillna(1)
+)
+
+
+final_sih[
+    "repeated_pattern_flag"
+] = (
+    final_sih[
+        "repeated_pattern_count"
+    ] > 1
+).astype(int)
+
+
+print(
+    "Records in repeated patterns:",
+    int(
+        final_sih[
+            "repeated_pattern_flag"
+        ].sum()
+    )
+)
+
+
+# ============================================================
+# STEP 20 — RAPID EXPENDITURE CONTEXT
+# ============================================================
+
+print("\n" + "=" * 70)
+print("RAPID EXPENDITURE CONTEXT")
+print("=" * 70)
+
+
+final_sih[
+    "rapid_expenditure"
+] = (
+    final_sih[
+        "days_since_previous"
+    ] <= 1
+)
+
+
+rapid_count = int(
+    final_sih[
+        "rapid_expenditure"
+    ].sum()
+)
+
+
+print(
+    "Rapid expenditure records:",
+    rapid_count
+)
+
+print(
+    "Rapid expenditure percentage:",
+    round(
+        rapid_count /
+        len(final_sih) *
+        100,
+        2
+    ),
+    "%"
+)
+
+print(
+    "\nRapid expenditure will remain contextual "
+    "and will not receive a major risk weight."
+)
+
+
+# ============================================================
+# STEP 21 — MPLADS ALLOCATION CONTEXT
+# ============================================================
+
+print("\n" + "=" * 70)
+print("MPLADS ALLOCATION ANALYSIS")
+print("=" * 70)
+
+
+allocation_info = (
+    sih_allocation
+    .rename(
+        columns={
+            "Hon'ble Members of Parliaments":
+            "Hon'ble Members of Parliament"
+        }
+    )
+    .copy()
+)
+
+
+allocation_info[
+    "Allocated AMOUNT ( ₹ )"
+] = pd.to_numeric(
+    allocation_info[
+        "Allocated AMOUNT ( ₹ )"
+    ],
+    errors="coerce"
+)
+
+
+allocation_info = (
+    allocation_info
+    .drop_duplicates(
+        subset=[
+            "Hon'ble Members of Parliament"
+        ]
+    )
+)
+
+
+mp_total_expenditure = (
+    sih_exp
+    .groupby(
+        "Hon'ble Members of Parliament"
+    )[
+        "Fund Disbursed Amount ( ₹ )"
+    ]
+    .sum()
+    .reset_index(
+        name="total_expenditure"
+    )
+)
+
+
+allocation_summary = (
+    mp_total_expenditure
+    .merge(
+        allocation_info[
+            [
+                "Hon'ble Members of Parliament",
+                "Allocated AMOUNT ( ₹ )"
+            ]
+        ],
+        on="Hon'ble Members of Parliament",
+        how="left"
+    )
+)
+
+
+allocation_summary[
+    "allocation_utilization"
+] = (
+    allocation_summary[
+        "total_expenditure"
+    ]
+    /
+    allocation_summary[
+        "Allocated AMOUNT ( ₹ )"
+    ]
+).replace(
+    [np.inf, -np.inf],
+    np.nan
+).fillna(0)
+
+
+allocation_summary[
+    "over_allocation"
+] = (
+    allocation_summary[
+        "total_expenditure"
+    ]
+    >
+    allocation_summary[
+        "Allocated AMOUNT ( ₹ )"
+    ]
+)
+
+
+final_sih = final_sih.merge(
+    allocation_summary[
+        [
+            "Hon'ble Members of Parliament",
+            "total_expenditure",
+            "Allocated AMOUNT ( ₹ )",
+            "allocation_utilization",
+            "over_allocation"
+        ]
+    ],
+    on="Hon'ble Members of Parliament",
+    how="left"
+)
+
+
+print(
+    "MPs with allocation data:",
+    int(
+        allocation_summary[
+            "Allocated AMOUNT ( ₹ )"
+        ].notna().sum()
+    )
+)
+
+print(
+    "Observed over-allocation cases:",
+    int(
+        allocation_summary[
+            "over_allocation"
+        ].sum()
+    )
+)
+
+
+# ============================================================
+# STEP 22 — BEHAVIORAL ANOMALY INDEX
+# ============================================================
+
+print("\n" + "=" * 70)
+print("BEHAVIORAL ANOMALY INDEX")
+print("=" * 70)
+
+
+score_min = (
+    final_sih[
+        "anomaly_score"
+    ].min()
+)
+
+score_max = (
+    final_sih[
+        "anomaly_score"
+    ].max()
+)
+
+
+final_sih[
+    "behavior_anomaly_index"
+] = (
+    (
+        final_sih[
+            "anomaly_score"
+        ]
+        -
+        score_min
+    )
+    /
+    (
+        score_max
+        -
+        score_min
+        + 1e-6
+    )
+) * 100
+
+
+print(
+    "Minimum anomaly score:",
+    round(score_min, 4)
+)
+
+print(
+    "Maximum anomaly score:",
+    round(score_max, 4)
+)
+
+
+# ============================================================
+# STEP 23 — CONTEXT SCORES
+# ============================================================
+
+print("\n" + "=" * 70)
+print("BUILDING CONTEXTUAL SIGNALS")
+print("=" * 70)
+
+
+# MP context
+final_sih[
+    "mp_context_score"
+] = (
+    np.clip(
+        final_sih[
+            "mp_expenditure_z"
+        ] / 5,
+        0,
+        1
+    ) * 100
+)
+
+
+# Vendor context
+final_sih[
+    "vendor_context_score"
+] = (
+    np.clip(
+        final_sih[
+            "vendor_activity_z"
+        ] / 5,
+        0,
+        1
+    ) * 100
+)
+
+
+# Repeated pattern
+final_sih[
+    "repeated_pattern_score"
+] = np.where(
+    final_sih[
+        "repeated_pattern_flag"
+    ] == 1,
+    100,
+    0
+)
+
+
+print("Contextual signals created.")
+
+
+# ============================================================
+# STEP 24 — FINAL INVESTIGATION-PRIORITY SCORE
+# ============================================================
+
+print("\n" + "=" * 70)
+print("FINAL INVESTIGATION-PRIORITY SCORE")
+print("=" * 70)
+
+
+# IMPORTANT:
+# This is NOT fraud probability.
+# It is an investigation-priority index.
+
+final_sih[
+    "investigation_priority_score"
+] = (
+    0.70 *
+    final_sih[
+        "behavior_anomaly_index"
+    ]
+    +
+    0.15 *
+    final_sih[
+        "mp_context_score"
+    ]
+    +
+    0.10 *
+    final_sih[
+        "vendor_context_score"
+    ]
+    +
+    0.05 *
+    final_sih[
+        "repeated_pattern_score"
+    ]
+)
+
+
+print(
+    "Score range:",
+    round(
+        final_sih[
+            "investigation_priority_score"
+        ].min(),
+        2
+    ),
+    "to",
+    round(
+        final_sih[
+            "investigation_priority_score"
+        ].max(),
+        2
+    )
+)
+
+
+# ============================================================
+# STEP 25 — DATA-DRIVEN PRIORITY CATEGORIES
+# ============================================================
+
+print("\n" + "=" * 70)
+print("INVESTIGATION PRIORITY CATEGORIES")
+print("=" * 70)
+
+
+high_threshold = (
+    final_sih[
+        "investigation_priority_score"
+    ].quantile(0.90)
+)
+
+
+medium_threshold = (
+    final_sih[
+        "investigation_priority_score"
+    ].quantile(0.60)
+)
+
+
+def assign_priority(score):
+
+    if score >= high_threshold:
+        return "HIGH"
+
+    elif score >= medium_threshold:
+        return "MEDIUM"
+
+    else:
+        return "LOW"
+
+
+final_sih[
+    "investigation_priority"
+] = (
+    final_sih[
+        "investigation_priority_score"
+    ]
+    .apply(assign_priority)
+)
+
+
+print(
+    "HIGH threshold:",
+    round(high_threshold, 2)
+)
+
+print(
+    "MEDIUM threshold:",
+    round(medium_threshold, 2)
+)
+
+
+print("\nPriority distribution:")
+
+print(
+    final_sih[
+        "investigation_priority"
+    ].value_counts()
+)
+
+
+# ============================================================
+# STEP 26 — EXPLAINABLE REASONS
+# ============================================================
+
+print("\n" + "=" * 70)
+print("GENERATING EXPLAINABLE REASONS")
+print("=" * 70)
+
+
+def explain_investigation(row):
+
+    reasons = []
+
+    if (
+        row[
+            "behavior_anomaly_index"
+        ] >= 75
+    ):
+        reasons.append(
+            "Strong behavioral anomaly"
+        )
+
+    if (
+        row[
+            "mp_expenditure_flag"
+        ] == 1
+    ):
+        reasons.append(
+            "Unusually high expenditure for MP"
+        )
+
+    if (
+        row[
+            "vendor_activity_flag"
+        ] == 1
+    ):
+        reasons.append(
+            "Unusually high vendor activity"
+        )
+
+    if (
+        row[
+            "repeated_pattern_flag"
+        ] == 1
+    ):
+        reasons.append(
+            "Repeated transaction pattern"
+        )
+
+    if row[
+        "rapid_expenditure"
+    ]:
+        reasons.append(
+            "Rapid expenditure pattern"
+        )
+
+    if bool(
+        row[
+            "over_allocation"
+        ]
+    ):
+        reasons.append(
+            "Observed expenditure exceeds recorded allocation"
+        )
+
+    if not reasons:
+
+        reasons.append(
+            "No major contextual warning signal"
+        )
+
+    return "; ".join(reasons)
+
+
+final_sih[
+    "investigation_reasons"
+] = (
+    final_sih
+    .apply(
+        explain_investigation,
+        axis=1
+    )
+)
+
+
+# ============================================================
+# STEP 27 — FINAL INVESTIGATION TABLE
+# ============================================================
+
+print("\n" + "=" * 70)
+print("FINAL INVESTIGATION REPORT")
+print("=" * 70)
+
+
+final_columns = [
+    "Work ID",
+    "State",
+    "Work",
+    "Hon'ble Members of Parliament",
+    "Constituency",
+    "Vendor Name",
+    "Payment Status",
+    "Expenditure Date",
+    "Fund Disbursed Amount ( ₹ )",
+
+    "anomaly_score",
+    "predicted_anomaly",
+    "behavior_anomaly_index",
+
+    "mp_expenditure_z",
+    "mp_expenditure_flag",
+
+    "vendor_transaction_count",
+    "vendor_activity_z",
+    "vendor_activity_flag",
+
+    "repeated_pattern_count",
+    "repeated_pattern_flag",
+
+    "days_since_previous",
+    "rapid_expenditure",
+
+    "total_expenditure",
+    "Allocated AMOUNT ( ₹ )",
+    "allocation_utilization",
+    "over_allocation",
+
+    "investigation_priority_score",
+    "investigation_priority",
+    "investigation_reasons"
+]
+
+
+final_investigation_table = (
+    final_sih[
+        final_columns
+    ]
+    .sort_values(
+        "investigation_priority_score",
+        ascending=False
+    )
+    .reset_index(drop=True)
+)
+
+
+print(
+    "Final investigation table:",
+    final_investigation_table.shape
+)
+
+
+print("\nTop 20 investigation-priority records:")
+
+display(
+    final_investigation_table.head(20)
+)
+
+
+# ============================================================
+# STEP 28 — FINAL PROJECT STATISTICS
+# ============================================================
+
+print("\n" + "=" * 70)
+print("FINAL PROJECT SUMMARY")
+print("=" * 70)
+
+
+total_sih_records = len(
+    final_sih
+)
+
+
+ml_anomalies = int(
+    final_sih[
+        "predicted_anomaly"
+    ].sum()
+)
+
+
+high_priority = int(
+    (
+        final_sih[
+            "investigation_priority"
+        ]
+        == "HIGH"
+    ).sum()
+)
+
+
+medium_priority = int(
+    (
+        final_sih[
+            "investigation_priority"
+        ]
+        == "MEDIUM"
+    ).sum()
+)
+
+
+low_priority = int(
+    (
+        final_sih[
+            "investigation_priority"
+        ]
+        == "LOW"
+    ).sum()
+)
+
+
+mp_flags = int(
+    final_sih[
+        "mp_expenditure_flag"
+    ].sum()
+)
+
+
+vendor_flags = int(
+    final_sih[
+        "vendor_activity_flag"
+    ].sum()
+)
+
+
+repeated_flags = int(
+    final_sih[
+        "repeated_pattern_flag"
+    ].sum()
+)
+
+
+over_allocation_count = int(
+    final_sih[
+        "over_allocation"
+    ].sum()
+)
+
+
+print(
+    f"""
+SIH RECORDS
+-----------
+Total records                     : {total_sih_records}
+
+ML BEHAVIORAL DETECTION
+-----------------------
+Behavioral anomalies              : {ml_anomalies}
+Anomaly percentage                : {ml_anomalies / total_sih_records * 100:.2f}%
+
+INVESTIGATION PRIORITY
+----------------------
+HIGH                              : {high_priority}
+MEDIUM                            : {medium_priority}
+LOW                               : {low_priority}
+
+CONTEXTUAL SIGNALS
+------------------
+Unusual MP expenditure            : {mp_flags}
+Unusual vendor activity           : {vendor_flags}
+Repeated transaction patterns     : {repeated_flags}
+Observed over-allocation cases    : {over_allocation_count}
+
+KAGGLE MODEL
+------------
+Accuracy                          : {accuracy:.4f}
+ROC-AUC                           : {roc_auc:.4f}
+PR-AUC                            : {pr_auc:.4f}
+"""
+)
+
+
+# ============================================================
+# STEP 29 — EXPORT KAGGLE METRICS
+# ============================================================
+
+kaggle_report_dict = (
+    classification_report(
+        y_true,
+        y_pred,
+        output_dict=True
+    )
+)
+
+
+kaggle_metrics = pd.DataFrame({
+    "metric": [
+        "Accuracy",
+        "Fraud Precision",
+        "Fraud Recall",
+        "Fraud F1",
+        "ROC-AUC",
+        "PR-AUC",
+        "False Positives",
+        "False Negatives"
+    ],
+
+    "value": [
+        accuracy,
+
+        kaggle_report_dict[
+            "1"
+        ]["precision"],
+
+        kaggle_report_dict[
+            "1"
+        ]["recall"],
+
+        kaggle_report_dict[
+            "1"
+        ]["f1-score"],
+
+        roc_auc,
+
+        pr_auc,
+
+        cm[0, 1],
+
+        cm[1, 0]
+    ]
+})
+
+
+kaggle_metrics.to_csv(
+    "/content/kaggle_metrics.csv",
+    index=False
+)
+
+
+# ============================================================
+# STEP 30 — EXPORT SIH RESULTS
+# ============================================================
+
+
+final_sih.to_csv(
+    "/content/sih_anomaly_results.csv",
+    index=False
+)
+
+
+final_investigation_table.to_csv(
+    "/content/sih_investigation_report.csv",
+    index=False
+)
+
+
+high_priority_records = (
+    final_investigation_table[
+        final_investigation_table[
+            "investigation_priority"
+        ] == "HIGH"
+    ]
+    .copy()
+)
+
+
+high_priority_records.to_csv(
+    "/content/sih_high_priority_records.csv",
+    index=False
+)
+
+
+# ============================================================
+# STEP 31 — SIH VISUALIZATIONS
+# ============================================================
+
+print("\n" + "=" * 70)
+print("GENERATING SIH VISUALIZATIONS")
+print("=" * 70)
+
+
+# ------------------------------------------------------------
+# Anomaly score distribution
+# ------------------------------------------------------------
+
+plt.figure(figsize=(10, 6))
+
+plt.hist(
+    final_sih[
+        "anomaly_score"
+    ],
+    bins=50
+)
+
+plt.xlabel(
+    "Isolation Forest Anomaly Score"
+)
+
+plt.ylabel(
+    "Number of Records"
+)
+
+plt.title(
+    "SIH Behavioral Anomaly Score Distribution"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    "/content/sih_anomaly_score_distribution.png",
+    dpi=300
+)
+
+plt.show()
+
+
+# ------------------------------------------------------------
+# Priority distribution
+# ------------------------------------------------------------
+
+priority_counts = (
+    final_sih[
+        "investigation_priority"
+    ]
+    .value_counts()
+    .reindex(
+        [
+            "LOW",
+            "MEDIUM",
+            "HIGH"
+        ],
+        fill_value=0
+    )
+)
+
+
+plt.figure(figsize=(8, 6))
+
+plt.bar(
+    priority_counts.index,
+    priority_counts.values
+)
+
+plt.xlabel(
+    "Investigation Priority"
+)
+
+plt.ylabel(
+    "Number of Records"
+)
+
+plt.title(
+    "SIH Investigation Priority Distribution"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    "/content/sih_investigation_priority.png",
+    dpi=300
+)
+
+plt.show()
+
+
+# ------------------------------------------------------------
+# Top 20 investigation records
+# ------------------------------------------------------------
+
+top20 = (
+    final_sih
+    .sort_values(
+        "investigation_priority_score",
+        ascending=False
+    )
+    .head(20)
+)
+
+
+plt.figure(figsize=(12, 7))
+
+plt.bar(
+    range(len(top20)),
+    top20[
+        "investigation_priority_score"
+    ]
+)
+
+plt.xlabel(
+    "Top 20 SIH Records"
+)
+
+plt.ylabel(
+    "Investigation Priority Score"
+)
+
+plt.title(
+    "Top 20 SIH Investigation-Priority Records"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    "/content/top20_sih_investigation_records.png",
+    dpi=300
+)
+
+plt.show()
+
+
+# ============================================================
+# STEP 32 — FINAL SANITY CHECK
+# ============================================================
+
+print("\n" + "=" * 70)
+print("FINAL SANITY CHECK")
+print("=" * 70)
+
+
+checks = {
+
+    "SIH record count preserved":
+        len(final_sih) == len(sih_exp),
+
+    "Anomaly scores available":
+        final_sih[
+            "anomaly_score"
+        ].notna().all(),
+
+    "Investigation scores available":
+        final_sih[
+            "investigation_priority_score"
+        ].notna().all(),
+
+    "Priority labels available":
+        final_sih[
+            "investigation_priority"
+        ].notna().all(),
+
+    "Investigation explanations available":
+        final_sih[
+            "investigation_reasons"
+        ].notna().all(),
+
+    "No infinite investigation scores":
+        np.isfinite(
+            final_sih[
+                "investigation_priority_score"
+            ]
+        ).all(),
+
+    "Final table size matches SIH":
+        len(
+            final_investigation_table
+        ) == len(final_sih)
+}
+
+
+for check_name, result in checks.items():
+
+    print(
+        f"{'PASS' if result else 'FAIL':5} | "
+        f"{check_name}"
+    )
+
+
+all_passed = all(
+    checks.values()
+)
+
+
+print("\n" + "=" * 70)
+
+
+if all_passed:
+
+    print(
+        "PROJECT PIPELINE SANITY CHECK: PASS"
+    )
+
+else:
+
+    print(
+        "PROJECT PIPELINE SANITY CHECK: REVIEW REQUIRED"
+    )
+
+
+# ============================================================
+# STEP 33 — FINAL OUTPUT FILE LIST
+# ============================================================
+
+print("\n" + "=" * 70)
+print("PROJECT OUTPUT FILES")
+print("=" * 70)
+
+
+output_files = [
+    "/content/kaggle_metrics.csv",
+    "/content/kaggle_roc_curve.png",
+    "/content/kaggle_precision_recall_curve.png",
+    "/content/sih_anomaly_results.csv",
+    "/content/sih_investigation_report.csv",
+    "/content/sih_high_priority_records.csv",
+    "/content/sih_anomaly_score_distribution.png",
+    "/content/sih_investigation_priority.png",
+    "/content/top20_sih_investigation_records.png"
+]
+
+
+for path in output_files:
+
+    if os.path.exists(path):
+
+        size_kb = (
+            os.path.getsize(path)
+            / 1024
+        )
+
+        print(
+            f"CREATED | {os.path.basename(path):<45} "
+            f"| {size_kb:.1f} KB"
+        )
+
+    else:
+
+        print(
+            f"MISSING | {os.path.basename(path)}"
+        )
+
+
+# ============================================================
+# PROJECT COMPLETE
+# ============================================================
+
+print(f"""
+Behavioral anomalies              : {ml_anomalies}
+Anomaly percentage                : {ml_anomalies / total_sih_records * 100:.2f}%
+""")
+
+print("""
+The project has completed:
+
+1. Dataset loading
+2. Data cleaning
+3. Behavioral feature engineering
+4. Normal-behavior baseline construction
+5. Isolation Forest training
+6. Kaggle fraud evaluation
+7. ROC-AUC / PR-AUC evaluation
+8. Cross-domain SIH anomaly detection
+9. MP-level contextual analysis
+10. Vendor activity analysis
+11. Repeated transaction analysis
+12. Rapid expenditure contextual analysis
+13. MPLADS allocation analysis
+14. Investigation-priority scoring
+15. Explainable investigation reasons
+16. Result exports
+17. Model evaluation plots
+18. SIH investigation plots
+19. Final sanity validation
+
+IMPORTANT:
+SIH anomaly records are NOT confirmed fraud.
+They represent records with unusual behavioral/contextual patterns
+that may deserve further investigation.
+""")
+unsupervised learning
